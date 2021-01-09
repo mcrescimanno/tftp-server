@@ -6,6 +6,8 @@ const { parseMessage } = require('./messages/utilities')
 const { Ack } = require('./messages/Ack')
 const { Data } = require("./messages/Data")
 const { ErrorMessage } = require("./messages/ErrorMessage")
+const { log } = require("./log")
+
 
 class Server {
     constructor(port, address) {
@@ -32,41 +34,41 @@ class Server {
     _onListening() {
         /* Called after socket.bind */
         let address = this.socket.address()
-        console.log(`server listening ${address.address}:${address.port}`)
+        log.info(`server listening ${address.address}:${address.port}`)
     }
 
     _onError(err) {
-        console.log(`server error:\n${err.stack}`)
+        log.error(`server error:\n${err.stack}`)
         this.socket.close()
     }
 
     _onClose() {
-        console.log("Closing")
+        log.info("Closing")
     }
 
     _onConnect() {
-        console.log("Connecting")
+        log.info("Connecting")
     }
 
-    _onMessage(msg, rinfo) {
+    async _onMessage(msg, rinfo) {
         let request = parseMessage(msg)
         if (request.opcode === 1) {
-            this.handleRRQ(request, rinfo);
+            await this.handleRRQ(request, rinfo);
         }
         else if (request.opcode === 2) {
-            this.handleWRQ(request, rinfo);
+            await this.handleWRQ(request, rinfo);
         }
         else if (request.opcode === 3) {
-            this.handleData(request, rinfo);
+            await this.handleData(request, rinfo);
         }
         else if (request.opcode === 4) {
-            this.handleAck(request, rinfo);
+            await this.handleAck(request, rinfo);
         }
     }
 
     /* Private Methods */
 
-    handleRRQ(request, rinfo) {
+    async handleRRQ(request, rinfo) {
         /* 
             1. Open a readstream on a file, throw error to client if not exists (record job in memory)
             2. Assemble initial DATA Packet from first 512 bytes of file, send to client
@@ -76,10 +78,24 @@ class Server {
         const existingJob = this.currentJobs.get[clientTID]
 
         if (!existingJob) {
+            
+            let rfs = null;
+            try {
+                rfs = await ReadFileStream.createFileStreamAsync(request.filename, request.mode)    
+            } catch (err) {
+                if (err.code === "ENOENT") {
+                    let error = new ErrorMessage(1, "File not found.")
+                    return await this._sendError(error, rinfo.port, rinfo.address)
+                }
+                else {
+                    throw err;
+                }
+            }
+            
+            
             let job = {
-                rinfo: rinfo,
-                // We need to catch if the file exists, and send error if not.
-                stream: ReadFileStream.createFileStream(request.filename, request.mode),
+                rinfo: rinfo,                
+                stream: rfs,
                 filename: request.filename,
                 mode: request.mode,
                 sentFinalDataPacket: false
@@ -88,22 +104,20 @@ class Server {
             this.currentJobs.get[clientTID] = job
 
             // Send first data packet back
-            let firstBlock = job.stream.readBlock(1)
+            let firstBlock = await job.stream.readBlockAsync(1)
             let data = new Data(1, firstBlock);
-            this.socket.send(data.toBuffer(), rinfo.port, rinfo.address, (err, bytesSent) => {
-                if (err) console.error(err);
+            await this._sendAsync(data.toBuffer(), rinfo.port, rinfo.address)
 
-                if (firstBlock.length < 512) {
-                    job.sentFinalDataPacket = true
-                }
-            })            
+            if (firstBlock.length < 512) {
+                job.sentFinalDataPacket = true
+            }
         }
         else {
             // RRQ alread exists and in progress. What to do in this case? Do we send an error to client?
         }
     }
 
-    handleAck(request, rinfo) {
+    async handleAck(request, rinfo) {
         /*
             1. Find existing job for this clientTID, send error to client if not exists
             2. Assemble nth (ack.blockNumber + 1) DATA Packet from the readstream
@@ -118,82 +132,94 @@ class Server {
             let nextBlockNumber = request.blockNumber + 1;
 
             if (existingJob.sentFinalDataPacket) {
-                rfs.close()
+                await rfs.closeAsync()
                 delete this.currentJobs.get[clientTID];
             }
             else {
                 // Send nth Block
-                let nthBlock = rfs.readBlock(nextBlockNumber)
+                let nthBlock = await rfs.readBlockAsync(nextBlockNumber)
                 let data = new Data(nextBlockNumber, nthBlock);
-                this.socket.send(data.toBuffer(), rinfo.port, rinfo.address, (err, bytesSent) => {
-                    if (err) console.error(err);
+                await this._sendAsync(data.toBuffer(), rinfo.port, rinfo.address)
 
-                    if (nthBlock.length < 512) {
-                        existingJob.sentFinalDataPacket = true
-                    }
-                })
+                if (nthBlock.length < 512) {
+                    existingJob.sentFinalDataPacket = true
+                }
             }            
         }
         else {
             let error = new ErrorMessage(5, "Unknown transfer ID.")
-            this._sendError(error, rinfo.port, rinfo.address)
+            await this._sendError(error, rinfo.port, rinfo.address)
         }
     }
 
-    handleWRQ(request, rinfo) {
+    async handleWRQ(request, rinfo) {
         let clientTID = `${rinfo.address}:${rinfo.port}`;
         const exists = this.currentJobs.put[clientTID]
 
         // Validate that the filename is not outside of the server root (ie ../../path/to/file)
 
         if (!exists) {
+            let wfs = new WriteFileStream(request.filename, request.mode)
             let job = {
                 rinfo: rinfo,
-                stream: new WriteFileStream(request.filename, request.mode),
+                stream: wfs,
                 filename: request.filename,
                 mode: request.mode
             };
         
             this.currentJobs.put[clientTID] = job;    
-            this._sendWQRAck(rinfo.port, rinfo.address);
+            await this._sendWQRAck(rinfo.port, rinfo.address);
         }
         else {
             // WRQ already exists/in progress. What to do in this case? Do we send an error to client?            
         }
     }
 
-    handleData(request, rinfo) {    
+    async handleData(request, rinfo) {    
         let clientTID = `${rinfo.address}:${rinfo.port}`;
         const existingJob = this.currentJobs.put[clientTID];
 
         if (existingJob) {
-            let fileStream = existingJob.stream.writeStream;
+            let wfs = existingJob.stream;
             let isLastDataPacket = request.data.length < 512;
-            fileStream.write(request.data);
+            await wfs.writeChunk(request.data);
     
             if (isLastDataPacket) {
-                fileStream.end(null, null, () => {
-                    delete this.currentJobs.put[clientTID];
-                });
+                await wfs.end()
+                delete this.currentJobs.put[clientTID];
             }
     
             let ack = new Ack(request.blockNumber).toBuffer();
-            this.socket.send(ack, rinfo.port, rinfo.address);
+            await this._sendAsync(ack, rinfo.port, rinfo.address)
         } 
         else {
             let error = new ErrorMessage(5, "Unknown transfer ID.")
-            this._sendError(error, rinfo.port, rinfo.address)
+            await this._sendError(error, rinfo.port, rinfo.address)
         }
     }
 
-    _sendWQRAck(port, address) {
+    async _sendWQRAck(port, address) {
         let ack = Ack.getDefaultAck().toBuffer();
-        this.socket.send(ack, port, address);
+        await this._sendAsync(ack, port, address)
     }
 
-    _sendError(errorMessage, port, address) {
+    async _sendError(errorMessage, port, address) {
         let serialized = errorMessage.toBuffer()
-        this.socket.send(serialized, port, address)
+        await this._sendAsync(serialized, port, address)
+    }
+
+    // Small Promise-wrapper for dgram.socket.send callback api
+    _sendAsync(msg, port, address) {
+        return new Promise((resolve, reject) => {
+            this.socket.send(msg, port, address, (err, bytes) => {
+                if (err) {
+                    reject(err)
+                }
+                else {
+                    resolve(bytes)
+                }                
+            })
+        })
     }
 
     /* Public Methods */
@@ -203,7 +229,7 @@ class Server {
     }
     
     stopServer() {
-        this.socket.close(() => console.log("TFTP Server Stopped"));
+        this.socket.close()
     }
 }
 

@@ -34,7 +34,8 @@ class ReadFileStream {
     }
 
     readBlockAsync(blockNumber) {
-        let startByte = blockNumber * 512
+        let blockIndex = blockNumber - 1;
+        let startByte = blockIndex * 512
         let buf = Buffer.alloc(512)
 
         return new Promise((resolve,reject) => {
@@ -43,7 +44,15 @@ class ReadFileStream {
                     reject(err)
                 }
                 else {
-                    resolve({bytesRead, buffer})
+                    if (bytesRead < 512) {
+                        // Note: subarray creates a new buffer that references the same underlying data as buf.
+                        // Modifying actualSizeBuf will modify buf.
+                        let actualSizeBuf = buffer.subarray(0, bytesRead)
+                        resolve(actualSizeBuf)
+                        return;
+                    }
+                    resolve(buffer)
+                    return;                
                 }
             });
         });
@@ -51,7 +60,14 @@ class ReadFileStream {
     
     closeAsync() {
         return new Promise((resolve, reject) => {
-            fs.close(this.fd, (err) => reject(err))
+            fs.close(this.fd, (err) => {
+                if (err) {
+                    reject(err)
+                }
+                else {
+                    resolve(null)
+                }
+            })
         })
     }
 }

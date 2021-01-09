@@ -1,5 +1,5 @@
 const fs = require("fs")
-
+const log = require("./log")
 class WriteFileStream {
     constructor(filepath, mode) {
         this.filepath = filepath;
@@ -26,7 +26,7 @@ class WriteFileStream {
 
     _onError(err) {
         // The 'error' event is emitted if an error occurred while writing or piping data.
-        console.error(err);
+        log.error(err);
     }
 
     _onFinish() {
@@ -53,6 +53,25 @@ class WriteFileStream {
         // Emitted when the fs.WriteStream is ready to be used.
         // Fires immediately after 'open'.
         let x = 1;
+    }
+
+    writeChunk(buffer) {
+        return new Promise((resolve, reject) => {
+            this.writeStream.write(buffer, (err) => {
+                if (err) {
+                    reject(err)
+                }
+                else {
+                    resolve(null)
+                }
+            })
+        })        
+    }
+
+    end() {
+        return new Promise((resolve, reject) => {
+            this.writeStream.end(() => resolve(null))
+        })
     }
 }
 

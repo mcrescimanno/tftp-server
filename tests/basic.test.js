@@ -6,7 +6,32 @@ const path = require("path")
 
 const clientGetFolder = path.join(__dirname, "client-root/get")
 
-describe("Comprehensive Tests", () => {
+async function cleanupTestFiles() {
+    let rmPromise = function(fpath) {
+        return new Promise((resolve, reject) => {
+            fs.rm(fpath, (err) => {
+                if (err) return reject(err);
+                return resolve(null)
+            })
+        })
+    }
+
+    return new Promise(async(resolve, reject) => {
+        fs.readdir(clientGetFolder, async (err, files) => {
+            if (err) return reject(err);
+    
+            files.forEach(async filename => {
+                let fpath = path.join(clientGetFolder, filename)
+                await rmPromise(fpath)
+            })
+
+            resolve(null)
+            return;
+        })
+    })
+}
+
+describe("Basic Upload/Download Tests", () => {
     let tftpServer = null
     let client = null
 
@@ -23,21 +48,11 @@ describe("Comprehensive Tests", () => {
         })
     })
     
-    afterAll(() => {
+    afterAll(async () => {
         tftpServer.stopServer();
     
         // Remove all files in the client-root folder
-        fs.readdir(clientGetFolder, (err, files) => {
-            if (err) {
-                console.error(err)
-                return;
-            }
-    
-            files.forEach(filename => {
-                let fpath = path.join(clientGetFolder, filename)
-                fs.rmSync(fpath)
-            })
-        })
+        await cleanupTestFiles();
     })
 
     test("Client gets text file to from server", (done) => {
@@ -71,6 +86,10 @@ describe("Comprehensive Tests", () => {
     
         client.get(remoteFilePath, localFilePath, callback)
     })
+
+    // test("Client uploads image file to server.", done => {
+
+    // })
 })
 
 
