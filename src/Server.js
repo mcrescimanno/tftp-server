@@ -7,6 +7,7 @@ const { Ack } = require('./messages/Ack')
 const { Data } = require("./messages/Data")
 const { ErrorMessage } = require("./messages/ErrorMessage")
 const { log } = require("./log")
+const { BlockTimer } = require("./BlockTimer")
 
 
 class Server {
@@ -27,6 +28,9 @@ class Server {
             .on("listening", this._onListening.bind(this))
             .on("message", this._onMessage.bind(this))
         ;
+
+        this._endConnectionToUnresponsiveClient = this._endConnectionToUnresponsiveClient.bind(this)
+        this._sendNthDataBlock = this._sendNthDataBlock.bind(this)
     }
 
     /* Event Handlers for UDP Socket */
@@ -67,18 +71,12 @@ class Server {
     }
 
     /* Private Methods */
-
     async handleRRQ(request, rinfo) {
-        /* 
-            1. Open a readstream on a file, throw error to client if not exists (record job in memory)
-            2. Assemble initial DATA Packet from first 512 bytes of file, send to client
-            3. Resend DATA if no response (until retries hits 0, then send error and remove job)
-        */
         let clientTID = `${rinfo.address}:${rinfo.port}`;
         const existingJob = this.currentJobs.get[clientTID]
 
         if (!existingJob) {
-            
+
             let rfs = null;
             try {
                 rfs = await ReadFileStream.createFileStreamAsync(request.filename, request.mode)    
@@ -90,27 +88,22 @@ class Server {
                 else {
                     throw err;
                 }
-            }
-            
+            }            
             
             let job = {
                 rinfo: rinfo,                
                 stream: rfs,
                 filename: request.filename,
                 mode: request.mode,
-                sentFinalDataPacket: false
+                sentFinalDataPacket: false,
+                blockTimer: new BlockTimer(rinfo, { endFuncAsync: this._endConnectionToUnresponsiveClient, retryFuncAsync: this._sendNthDataBlock })
             }
 
             this.currentJobs.get[clientTID] = job
 
             // Send first data packet back
-            let firstBlock = await job.stream.readBlockAsync(1)
-            let data = new Data(1, firstBlock);
-            await this._sendAsync(data.toBuffer(), rinfo.port, rinfo.address)
-
-            if (firstBlock.length < 512) {
-                job.sentFinalDataPacket = true
-            }
+            await this._sendNthDataBlock({rinfo, blockNumber: 1})
+            job.blockTimer.startTimer()
         }
         else {
             // RRQ alread exists and in progress. What to do in this case? Do we send an error to client?
@@ -118,32 +111,25 @@ class Server {
     }
 
     async handleAck(request, rinfo) {
-        /*
-            1. Find existing job for this clientTID, send error to client if not exists
-            2. Assemble nth (ack.blockNumber + 1) DATA Packet from the readstream
-            3. Handle if last data packet to send to client (only done when we receive the ack for the last data packet)
-            3. Resend DATA if no response (until retries hits 0, then send error and remove job)
-        */
         let clientTID = `${rinfo.address}:${rinfo.port}`;
         const existingJob = this.currentJobs.get[clientTID]
 
         if (existingJob) {
             let rfs = existingJob.stream;
+            let blockTimer = existingJob.blockTimer;
+
             let nextBlockNumber = request.blockNumber + 1;
+            if (request.blockNumber === blockTimer.blockNumber) {
+                blockTimer.resetTimer(nextBlockNumber)
+            }            
 
             if (existingJob.sentFinalDataPacket) {
                 await rfs.closeAsync()
                 delete this.currentJobs.get[clientTID];
             }
             else {
-                // Send nth Block
-                let nthBlock = await rfs.readBlockAsync(nextBlockNumber)
-                let data = new Data(nextBlockNumber, nthBlock);
-                await this._sendAsync(data.toBuffer(), rinfo.port, rinfo.address)
-
-                if (nthBlock.length < 512) {
-                    existingJob.sentFinalDataPacket = true
-                }
+                await this._sendNthDataBlock({rinfo, blockNumber: nextBlockNumber})
+                blockTimer.startTimer()
             }            
         }
         else {
@@ -222,8 +208,35 @@ class Server {
         })
     }
 
-    /* Public Methods */
+    async _sendNthDataBlock(execContext) {
+        let {rinfo, blockNumber} = execContext;
+        let clientTID = `${rinfo.address}:${rinfo.port}`;
+        const existingJob = this.currentJobs.get[clientTID]
+        let rfs = existingJob.stream
 
+        let nthBlock = await rfs.readBlockAsync(blockNumber)
+        let data = new Data(blockNumber, nthBlock);
+        await this._sendAsync(data.toBuffer(), rinfo.port, rinfo.address)
+
+        if (nthBlock.length < 512) {
+            existingJob.sentFinalDataPacket = true
+        }
+    }
+
+    async _endConnectionToUnresponsiveClient(execContext) {
+        let {rinfo, blockNumber} = execContext
+
+        let clientTID = `${rinfo.address}:${rinfo.port}`;
+        const existingJob = this.currentJobs.get[clientTID]
+        
+        await existingJob.stream.closeAsync()
+        delete this.currentJobs.get[clientTID];        
+
+        let error = new ErrorMessage(0, "Client Unresponsive.")
+        await this._sendError(error, rinfo.port, rinfo.address)
+    }
+
+    /* Public Methods */
     startServer() {
         this.socket.bind(this.port, this.address)
     }
